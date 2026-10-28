@@ -1,0 +1,1 @@
+#define HAVE_EMSCRIPTEN_TIMERS 1

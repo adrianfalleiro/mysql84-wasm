@@ -1,0 +1,462 @@
+diff --git a/client/mysql.cc b/client/mysql.cc
+index aea2613f..d7da79f1 100644
+--- a/client/mysql.cc
++++ b/client/mysql.cc
+@@ -91,6 +91,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+ 
+ // Not using syslog but EventLog on Win32, so a dummy facility is enough.
+ #define LOG_USER 0
++#elif defined(__EMSCRIPTEN__)
++#include <syslog.h>
+ #else
+ #include <readline.h>
+ #include <syslog.h>
+diff --git a/cmake/readline.cmake b/cmake/readline.cmake
+index 86f7062f..ed9a6486 100644
+--- a/cmake/readline.cmake
++++ b/cmake/readline.cmake
+@@ -214,7 +214,10 @@ IF (NOT WITH_EDITLINE AND NOT WIN32)
+ ENDIF()
+ 
+ MACRO (MYSQL_CHECK_EDITLINE)
+-  IF (NOT WIN32)
++  IF (EMSCRIPTEN)
++    # The WASM command-line client uses batch input; no terminal editing.
++    SET(EDITLINE_LIBRARY "")
++  ELSEIF (NOT WIN32)
+     MYSQL_CHECK_MULTIBYTE()
+ 
+     IF(WITH_EDITLINE STREQUAL "bundled") 
+@@ -227,5 +230,5 @@ MACRO (MYSQL_CHECK_EDITLINE)
+     ELSE()
+       MESSAGE(FATAL_ERROR "WITH_EDITLINE must be bundled or system")
+     ENDIF()
+-  ENDIF(NOT WIN32)
++  ENDIF()
+ ENDMACRO()
+diff --git a/cmake/zlib.cmake b/cmake/zlib.cmake
+index eefe9dd1..313d47ee 100644
+--- a/cmake/zlib.cmake
++++ b/cmake/zlib.cmake
+@@ -105,6 +105,10 @@ FUNCTION(MYSQL_USE_BUNDLED_ZLIB)
+ 
+   ADD_SUBDIRECTORY(extra/zlib)
+ 
++  IF(EMSCRIPTEN)
++    TARGET_COMPILE_DEFINITIONS(zlib_objlib PRIVATE Z_HAVE_UNISTD_H)
++  ENDIF()
++
+   # Add support for bundled curl.
+   ADD_LIBRARY(ZLIB::ZLIB ALIAS zlib_interface)
+ 
+diff --git a/config.h.cmake b/config.h.cmake
+index 14193ede..99254f4f 100644
+--- a/config.h.cmake
++++ b/config.h.cmake
+@@ -140,6 +140,7 @@
+ #cmakedefine HAVE_SETNS 1
+ #cmakedefine HAVE_KQUEUE_TIMERS 1
+ #cmakedefine HAVE_POSIX_TIMERS 1
++#cmakedefine HAVE_EMSCRIPTEN_TIMERS 1
+ 
+ /* Endianess */
+ #cmakedefine WORDS_BIGENDIAN 1
+diff --git a/configure.cmake b/configure.cmake
+index fe8288ef..d7c39ba4 100644
+--- a/configure.cmake
++++ b/configure.cmake
+@@ -333,7 +333,10 @@ ELSEIF(HAVE_TIMER_CREATE AND HAVE_TIMER_SETTIME)
+   SET(HAVE_POSIX_TIMERS 1 CACHE INTERNAL "Have POSIX timer-related functions")
+ ENDIF()
+ 
+-IF(NOT HAVE_POSIX_TIMERS AND NOT HAVE_KQUEUE_TIMERS AND NOT WIN32)
++IF(EMSCRIPTEN)
++  SET(HAVE_EMSCRIPTEN_TIMERS 1)
++ENDIF()
++IF(NOT HAVE_POSIX_TIMERS AND NOT HAVE_KQUEUE_TIMERS AND NOT WIN32 AND NOT HAVE_EMSCRIPTEN_TIMERS)
+   MESSAGE(FATAL_ERROR "No mysys timer support detected!")
+ ENDIF()
+ 
+diff --git a/include/my_timer.h b/include/my_timer.h
+index 5cabd180..415a03ba 100644
+--- a/include/my_timer.h
++++ b/include/my_timer.h
+@@ -31,7 +31,10 @@
+ #include "my_config.h"
+ 
+ /* POSIX timers API. */
+-#ifdef HAVE_POSIX_TIMERS
++#ifdef HAVE_EMSCRIPTEN_TIMERS
++struct emscripten_timer_state;
++typedef emscripten_timer_state *os_timer_t;
++#elif defined(HAVE_POSIX_TIMERS)
+ #include <time.h> /* timer_t */
+ 
+ typedef timer_t os_timer_t;
+diff --git a/libmysql/CMakeLists.txt b/libmysql/CMakeLists.txt
+index e829f113..a61f0360 100644
+--- a/libmysql/CMakeLists.txt
++++ b/libmysql/CMakeLists.txt
+@@ -284,7 +284,7 @@ ELSE()
+   ENDIF()
+ ENDIF()
+ 
+-IF(HAVE_DNS_SRV EQUAL 0)
++IF(HAVE_DNS_SRV EQUAL 0 AND NOT EMSCRIPTEN)
+   MESSAGE(FATAL_ERROR "Can't find neither Win32 nor Unix DNS SRV APIs")
+ ENDIF()
+ #
+diff --git a/libmysql/dns_srv.cc b/libmysql/dns_srv.cc
+index 97047bee..1d07a5d8 100644
+--- a/libmysql/dns_srv.cc
++++ b/libmysql/dns_srv.cc
+@@ -132,6 +132,15 @@ static bool get_dns_srv(Dns_srv_data &data, const char *dnsname, int &error) {
+     error = status;
+   return status != ERROR_SUCCESS;
+ }
++#elif defined(__EMSCRIPTEN__)
++#include <cerrno>
++
++// Emscripten's resolver does not expose SRV records. Report this explicitly;
++// regular mysql_real_connect with a hostname and port remains available.
++static bool get_dns_srv(Dns_srv_data &, const char *, int &error) {
++  error = ENOTSUP;
++  return true;
++}
+ #else
+ 
+ #error "No DNS SRV Support detected for your OS. Consider adjusting Cmake."
+diff --git a/mysys/CMakeLists.txt b/mysys/CMakeLists.txt
+index 78aa44b2..18e2cb51 100644
+--- a/mysys/CMakeLists.txt
++++ b/mysys/CMakeLists.txt
+@@ -172,6 +172,10 @@ IF(HAVE_POSIX_TIMERS)
+   LIST(APPEND MYSYS_SOURCES posix_timers.cc)
+ ENDIF()
+ 
++IF(HAVE_EMSCRIPTEN_TIMERS)
++  LIST(APPEND MYSYS_SOURCES emscripten_timers.cc)
++ENDIF()
++
+ IF(HAVE_KQUEUE_TIMERS)
+   LIST(APPEND MYSYS_SOURCES kqueue_timers.cc)
+ ENDIF()
+diff --git a/sql/CMakeLists.txt b/sql/CMakeLists.txt
+index 902bd89f..6baee4b0 100644
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -749,7 +749,7 @@ ENDIF()
+ IF(LINUX)
+   LIST(APPEND SQL_SHARED_SOURCES
+     resourcegroups/platform/thread_attrs_api_linux.cc)
+-ELSEIF(APPLE)
++ELSEIF(APPLE OR EMSCRIPTEN)
+   LIST(APPEND SQL_SHARED_SOURCES
+     resourcegroups/platform/thread_attrs_api_apple.cc)
+ ELSEIF(FREEBSD)
+@@ -1123,6 +1123,11 @@ MYSQL_ADD_EXECUTABLE(mysqld
+   ${MYSQLD_SOURCE} DESTINATION ${INSTALL_SBINDIR} COMPONENT Server
+   )
+ 
++IF(EMSCRIPTEN)
++  TARGET_LINK_OPTIONS(mysqld PRIVATE -g2 --emit-symbol-map
++    -sASSERTIONS=2 -sSTACK_OVERFLOW_CHECK=2)
++ENDIF()
++
+ # With Ninja, link huge executables one-by-one.
+ IF(WIN32)
+   SET_PROPERTY(TARGET mysqld PROPERTY JOB_POOL_LINK one_job)
+diff --git a/sql/conn_handler/socket_connection.cc b/sql/conn_handler/socket_connection.cc
+index 2463f6aa..4afc0fd6 100644
+--- a/sql/conn_handler/socket_connection.cc
++++ b/sql/conn_handler/socket_connection.cc
+@@ -1079,7 +1079,12 @@ static bool handle_admin_socket(
+ 
+   while (!connection_events_loop_aborted()) {
+ #ifdef HAVE_POLL
++#ifdef __EMSCRIPTEN__
++    // Emscripten signals do not interrupt a blocking raw-socket poll.
++    const int retval = poll(fds, NUMBER_OF_POLLED_FDS, 100);
++#else
+     const int retval = poll(fds, NUMBER_OF_POLLED_FDS, -1);
++#endif
+ #else
+     fd_set read_fds = client_fds;
+     const int retval =
+@@ -1100,6 +1105,7 @@ static bool handle_admin_socket(
+     if (retval < 0) return true;
+ 
+     if (connection_events_loop_aborted()) return false;
++    if (retval == 0) continue;
+ 
+ #ifdef HAVE_SETNS
+     /*
+@@ -1348,7 +1354,12 @@ const Listen_socket *Mysqld_socket_listener::get_listen_socket() const {
+ 
+ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
+ #ifdef HAVE_POLL
++#ifdef __EMSCRIPTEN__
++  // Recheck shutdown periodically because signals do not interrupt this poll.
++  int retval = poll(&m_poll_info.m_fds[0], m_socket_vector.size(), 100);
++#else
+   int retval = poll(&m_poll_info.m_fds[0], m_socket_vector.size(), -1);
++#endif
+ #else
+   m_select_info.m_read_fds = m_select_info.m_client_fds;
+   int retval = select((int)m_select_info.m_max_used_connection,
+@@ -1366,7 +1377,7 @@ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
+       LogErr(ERROR_LEVEL, ER_CONN_SOCKET_SELECT_FAILED, socket_errno);
+   }
+ 
+-  if (retval < 0 || connection_events_loop_aborted()) return nullptr;
++  if (retval <= 0 || connection_events_loop_aborted()) return nullptr;
+ 
+   /* Is this a new connection request ? */
+   const Listen_socket *listen_socket = get_listen_socket();
+diff --git a/sql/mysqld.cc b/sql/mysqld.cc
+index bcc645d6..ab3f4eda 100644
+--- a/sql/mysqld.cc
++++ b/sql/mysqld.cc
+@@ -935,6 +935,9 @@ MySQL clients support the protocol:
+ #include <netinet/in.h>
+ #endif
+ #include <signal.h>
++#ifdef __EMSCRIPTEN__
++#include <emscripten/threading.h>
++#endif
+ #include <stdarg.h>
+ #include <stddef.h>
+ #include <stdio.h>
+@@ -3749,6 +3752,11 @@ extern "C" void *signal_hand(void *arg [[maybe_unused]]) {
+   (void)sigaddset(&set, SIGUSR1);
+   (void)sigaddset(&set, SIGUSR2);
+ 
++#ifdef __EMSCRIPTEN__
++  // Emscripten stores the signal mask in thread-local state.
++  pthread_sigmask(SIG_BLOCK, &set, nullptr);
++#endif
++
+   /*
+     Signal to start_signal_handler that we are ready.
+     This works by waiting for start_signal_handler to free mutex,
+@@ -3774,8 +3782,17 @@ extern "C" void *signal_hand(void *arg [[maybe_unused]]) {
+     error = rc != 0;
+ #else
+     siginfo_t sig_info;
++#ifdef __EMSCRIPTEN__
++    // Emscripten's sigwaitinfo only checks pending signals and returns EINVAL
++    // when none are queued. Yield so pthread_kill's mailbox can deliver one.
++    while ((rc = sigwaitinfo(&set, &sig_info)) == -1 &&
++           (errno == EINTR || errno == EINVAL)) {
++      emscripten_thread_sleep(10);
++    }
++#else
+     while ((rc = sigwaitinfo(&set, &sig_info)) == -1 && errno == EINTR) {
+     }
++#endif
+     error = rc == -1;
+     if (!error) sig = sig_info.si_signo;
+ #endif             // __APPLE__
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_apple.cc b/sql/resourcegroups/platform/thread_attrs_api_apple.cc
+index 44083757..45e1ac79 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api_apple.cc
++++ b/sql/resourcegroups/platform/thread_attrs_api_apple.cc
+@@ -23,7 +23,11 @@
+ #include "thread_attrs_api.h"
+ 
+ #include <assert.h>
++#ifdef __EMSCRIPTEN__
++#include <unistd.h>
++#else
+ #include <sys/sysctl.h>
++#endif
+ #include <sys/types.h>
+ 
+ #include "sql/log.h"
+@@ -32,7 +36,7 @@ namespace resourcegroups {
+ namespace platform {
+ 
+ /*
+-  Mac OS doesn't have an explicit API to bind a set of processors with thread.
++  Mac OS and Emscripten don't expose an API to bind processors to a thread.
+   Hence platform APIs are just stubs on this platform.
+ */
+ 
+@@ -86,12 +90,17 @@ bool set_thread_priority(int, my_thread_os_id_t) {
+ uint32_t num_vcpus_using_affinity() { return 0; }
+ 
+ uint32_t num_vcpus_using_config() {
++#ifdef __EMSCRIPTEN__
++  const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
++  return ncpu > 0 ? static_cast<uint32_t>(ncpu) : 1;
++#else
+   int name[2] = {CTL_HW, HW_AVAILCPU};
+   int ncpu;
+ 
+   size_t size = sizeof(ncpu);
+   sysctl(name, 2, &ncpu, &size, nullptr, 0);
+   return ncpu;
++#endif
+ }
+ 
+ bool can_thread_priority_be_set() {
+diff --git a/sql/set_var.cc b/sql/set_var.cc
+index 923fdb1a..395e4865 100644
+--- a/sql/set_var.cc
++++ b/sql/set_var.cc
+@@ -481,7 +481,7 @@ void sys_var::set_user_host(THD *thd) {
+ void sys_var::do_deprecated_warning(THD *thd) {
+   if (deprecation_substitute != nullptr) {
+     char buf1[NAME_CHAR_LEN + 3];
+-    strxnmov(buf1, sizeof(buf1) - 1, "@@", name.str, 0);
++    strxnmov(buf1, sizeof(buf1) - 1, "@@", name.str, nullptr);
+ 
+     /*
+        if deprecation_substitute is an empty string,
+diff --git a/storage/innobase/innodb.cmake b/storage/innobase/innodb.cmake
+index 6b4f4583..caacf642 100644
+--- a/storage/innobase/innodb.cmake
++++ b/storage/innobase/innodb.cmake
+@@ -159,7 +159,7 @@ IF(HAVE_FALLOC_FL_ZERO_RANGE)
+ ENDIF()
+ 
+ IF(NOT MSVC)
+-IF(NOT CMAKE_CROSSCOMPILING)
++IF(NOT CMAKE_CROSSCOMPILING OR EMSCRIPTEN)
+   CHECK_C_SOURCE_RUNS(
+   "#include<stdint.h>
+   int main()
+diff --git a/utilities/CMakeLists.txt b/utilities/CMakeLists.txt
+index 865abc2e..c147a728 100644
+--- a/utilities/CMakeLists.txt
++++ b/utilities/CMakeLists.txt
+@@ -30,7 +30,7 @@ IF(NOT WITH_DEBUG)
+   DISABLE_DOCUMENTATION_WARNINGS()
+ ENDIF()
+ 
+-IF(NOT CMAKE_CROSSCOMPILING)
++IF(NOT CMAKE_CROSSCOMPILING OR EMSCRIPTEN)
+   MYSQL_ADD_EXECUTABLE(comp_err
+     comp_err.cc
+     COMPONENT Test
+diff --git a/mysys/emscripten_timers.cc b/mysys/emscripten_timers.cc
+new file mode 100644
+index 00000000..dcc8a115
+--- /dev/null
++++ b/mysys/emscripten_timers.cc
+@@ -0,0 +1,115 @@
++// Emscripten has pthreads but no POSIX timer_create/SIGEV_THREAD backend.
++#include "my_timer.h"
++
++#include <cerrno>
++#include <chrono>
++#include <condition_variable>
++#include <memory>
++#include <mutex>
++#include <system_error>
++#include <thread>
++#include <unordered_map>
++
++struct emscripten_timer_state {
++  my_timer_t *timer;
++  std::chrono::steady_clock::time_point deadline;
++  bool armed = false;
++};
++
++namespace {
++std::mutex timer_mutex;
++std::condition_variable timer_changed;
++std::unordered_map<os_timer_t, std::shared_ptr<emscripten_timer_state>> timers;
++std::thread timer_worker;
++bool stopping = false;
++
++void run_timers() {
++  std::unique_lock<std::mutex> lock(timer_mutex);
++  while (!stopping) {
++    std::shared_ptr<emscripten_timer_state> next;
++    for (const auto &entry : timers) {
++      if (entry.second->armed &&
++          (!next || entry.second->deadline < next->deadline))
++        next = entry.second;
++    }
++    if (!next) {
++      timer_changed.wait(lock);
++    } else if (std::chrono::steady_clock::now() < next->deadline) {
++      timer_changed.wait_until(lock, next->deadline);
++    } else {
++      // Commit the notification before unlocking. Cancel then reports state=0,
++      // so sql_timer retains its owner until this notification is delivered.
++      next->armed = false;
++      my_timer_t *timer = next->timer;
++      auto notify = timer->notify_function;
++      lock.unlock();
++      notify(timer);  // The callback may delete its own timer.
++      lock.lock();
++    }
++  }
++}
++}  // namespace
++
++int my_timer_initialize() {
++  std::lock_guard<std::mutex> lock(timer_mutex);
++  if (timer_worker.joinable()) return 0;
++  stopping = false;
++  try {
++    timer_worker = std::thread(run_timers);
++  } catch (const std::system_error &error) {
++    errno = error.code().value();
++    return -1;
++  }
++  return 0;
++}
++
++void my_timer_deinitialize() {
++  {
++    std::lock_guard<std::mutex> lock(timer_mutex);
++    stopping = true;
++    timer_changed.notify_all();
++  }
++  if (timer_worker.joinable()) timer_worker.join();
++  std::lock_guard<std::mutex> lock(timer_mutex);
++  timers.clear();
++}
++
++int my_timer_create(my_timer_t *timer) {
++  try {
++    auto state = std::make_shared<emscripten_timer_state>();
++    state->timer = timer;
++    std::lock_guard<std::mutex> lock(timer_mutex);
++    timers.emplace(state.get(), state);
++    timer->id = state.get();
++  } catch (const std::bad_alloc &) {
++    errno = ENOMEM;
++    return -1;
++  }
++  return 0;
++}
++
++int my_timer_set(my_timer_t *timer, unsigned long milliseconds) {
++  std::lock_guard<std::mutex> lock(timer_mutex);
++  auto &state = *timers.at(timer->id);
++  state.deadline = std::chrono::steady_clock::now() +
++                   std::chrono::milliseconds(milliseconds);
++  state.armed = milliseconds != 0;
++  timer_changed.notify_all();
++  return 0;
++}
++
++int my_timer_cancel(my_timer_t *timer, int *state) {
++  std::lock_guard<std::mutex> lock(timer_mutex);
++  auto &entry = *timers.at(timer->id);
++  *state = entry.armed ? 1 : 0;
++  entry.armed = false;
++  timer_changed.notify_all();
++  return 0;
++}
++
++void my_timer_delete(my_timer_t *timer) {
++  std::lock_guard<std::mutex> lock(timer_mutex);
++  timers.erase(timer->id);
++  timer->id = nullptr;
++  timer_changed.notify_all();
++}

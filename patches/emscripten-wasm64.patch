@@ -1,0 +1,43 @@
+--- a/src/lib/libcore.js
++++ b/src/lib/libcore.js
+@@ -1002,7 +1002,7 @@
+     }
+   },
+ 
+-  getaddrinfo__deps: ['$inetPton4', '$inetNtop4', '$inetPton6', '$inetNtop6', '$writeSockaddr', 'malloc', 'htonl',
++  getaddrinfo__deps: ['$inetPton4', '$inetNtop4', '$inetPton6', '$inetNtop6', '$writeSockaddr', 'malloc', 'htonl', '$lengthBytesUTF8', '$stringToUTF8',
+ #if NODERAWSOCKETS
+     '$nodeSockHelpers',
+ #else
+@@ -1049,18 +1049,28 @@
+       assert(!errno);
+ #endif
+ 
+-      ai = _malloc({{{ C_STRUCTS.addrinfo.__size__ }}});
++      // Keep the canonical string in the same allocation as addrinfo, so
++      // freeaddrinfo releases it with the node. JS strings/null are not
++      // pointer values and cannot be converted to BigInt for wasm64 stores.
++      var canonLength = canon && (flags & {{{ cDefs.AI_CANONNAME }}}) ? lengthBytesUTF8(canon) + 1 : 0;
++      ai = _malloc({{{ C_STRUCTS.addrinfo.__size__ }}} + canonLength);
++      var canonPointer = 0;
++      if (canonLength) {
++        canonPointer = ai + {{{ C_STRUCTS.addrinfo.__size__ }}};
++        stringToUTF8(canon, canonPointer, canonLength);
++      }
++      {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_flags, 'flags', 'i32') }}};
+       {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_family, 'family', 'i32') }}};
+       {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_socktype, 'type', 'i32') }}};
+       {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_protocol, 'proto', 'i32') }}};
+-      {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_canonname, 'canon', '*') }}};
++      {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_canonname, 'canonPointer', '*') }}};
+       {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_addr, 'sa', '*') }}};
+       if (family === {{{ cDefs.AF_INET6 }}}) {
+         {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_addrlen, C_STRUCTS.sockaddr_in6.__size__, 'i32') }}};
+       } else {
+         {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_addrlen, C_STRUCTS.sockaddr_in.__size__, 'i32') }}};
+       }
+-      {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_next, '0', 'i32') }}};
++      {{{ makeSetValue('ai', C_STRUCTS.addrinfo.ai_next, '0', '*') }}};
+ 
+       return ai;
+     }

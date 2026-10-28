@@ -1,0 +1,9 @@
+{
+  "name": "mysql84-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental MySQL 8.4 wasm64 port for Node with disk and MEMFS backends",
+  "devDependencies": {
+    "mysql2": "3.24.2"
+  }
+}
